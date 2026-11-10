@@ -35,6 +35,7 @@ import (
 	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/tsdb/record"
 	"github.com/prometheus/prometheus/tsdb/tombstones"
+	"github.com/prometheus/prometheus/tsdb/wlog"
 	"github.com/prometheus/prometheus/util/compression"
 )
 
@@ -970,4 +971,214 @@ func TestSeriesEviction_QueryStartingAtLastTimestampIsWaitedForByNextEviction(t 
 			})
 		})
 	}
+}
+
+// BenchmarkEvictionWALBlocking measures the post-GC tombstone logging phase, with
+// ten labels per candidate and 100,000 unrelated live series. Compaction, GC and
+// fixture construction are excluded. The late cases recreate 10% of the labels
+// immediately before entering the WAL, with insertion included in ns/op.
+//
+// Callback time is spent under the WAL write lock, excluding the record write.
+// WAL-call time includes lock acquisition, the callback and the write; it is not
+// an exact mutex hold time. Both report cumulative time per eviction and the
+// maximum individual call, so batching can be compared without changing this
+// benchmark. Writer metrics measure end-to-end Log latency for a continuously
+// competing writer of pre-encoded 128-sample records, including its startup and
+// shutdown writes. They depend on scheduling and are not latency guarantees.
+func BenchmarkEvictionWALBlocking(b *testing.B) {
+	type fixture struct {
+		deleted       map[storage.SeriesRef]struct{}
+		deletedLabels map[chunks.HeadSeriesRef]deletedSeries
+		recreated     []*memSeries
+	}
+	// Reuse expensive fixtures across calibration runs and compression/load cases,
+	// without retaining them in package globals after the benchmark finishes.
+	fixtures := make(map[int]*fixture)
+	var index *stripeSeries
+	type benchmarkCase struct {
+		series   int
+		compress compression.Type
+		writer   bool
+		late     bool
+	}
+	var cases []benchmarkCase
+	for _, n := range []int{1000, 10000, 100000, 1000000} {
+		for _, compress := range []compression.Type{compression.None, compression.Snappy} {
+			for _, writer := range []bool{false, true} {
+				cases = append(cases, benchmarkCase{series: n, compress: compress, writer: writer})
+			}
+		}
+	}
+	for _, n := range []int{100000, 1000000} {
+		cases = append(cases, benchmarkCase{series: n, compress: compression.Snappy, writer: true, late: true})
+	}
+	for _, c := range cases {
+		load, latePercent := "idle", 0
+		if c.writer {
+			load = "writer"
+		}
+		if c.late {
+			latePercent = 10
+		}
+		b.Run(fmt.Sprintf("series=%d/compress=%s/load=%s/late=%d", c.series, c.compress, load, latePercent), func(b *testing.B) {
+			if index == nil {
+				index = newStripeSeries(DefaultStripeSize, noopSeriesLifecycleCallback{})
+				for i := range 100000 {
+					lset := evictionWALBenchmarkLabels("live", i)
+					s := newMemSeries(lset, chunks.HeadSeriesRef(10000000+i), 0, false, false)
+					index.setUnlessAlreadySet(lset.Hash(), lset, s)
+				}
+			}
+			f := fixtures[c.series]
+			if f == nil {
+				f = &fixture{
+					deleted:       make(map[storage.SeriesRef]struct{}, c.series),
+					deletedLabels: make(map[chunks.HeadSeriesRef]deletedSeries, c.series),
+				}
+				for i := range c.series {
+					ref := storage.SeriesRef(i + 1)
+					f.deleted[ref] = struct{}{}
+					lset := evictionWALBenchmarkLabels("deleted", i)
+					// Model the labels and hash saved by GC before the measured phase.
+					f.deletedLabels[chunks.HeadSeriesRef(ref)] = deletedSeries{lset: lset, hash: lset.Hash()}
+				}
+				fixtures[c.series] = f
+			}
+			if c.late && f.recreated == nil {
+				for i := 0; i < c.series; i += 10 {
+					// Fresh label storage also exercises equality checks for recreated labels.
+					lset := evictionWALBenchmarkLabels("deleted", i)
+					f.recreated = append(f.recreated, newMemSeries(lset, chunks.HeadSeriesRef(20000000+i), 0, false, false))
+				}
+			}
+			wal, err := wlog.New(nil, nil, b.TempDir(), c.compress)
+			require.NoError(b, err)
+			defer func() {
+				b.StopTimer()
+				require.NoError(b, wal.Close())
+			}()
+			head := &Head{series: index}
+			var enc record.Encoder
+			require.NoError(b, wal.Log(enc.Series([]record.RefSeries{{Ref: 10000000, Labels: evictionWALBenchmarkLabels("live", 0)}}, nil)))
+			samples := make([]record.RefSample, 128)
+			for i := range samples {
+				samples[i] = record.RefSample{Ref: 10000000, T: int64(i + 1), V: float64(i)}
+			}
+			writerRecord := enc.Samples(samples, nil)
+			type writerResult struct {
+				calls      int64
+				total, max time.Duration
+				err        error
+			}
+			var writerStats writerResult
+			var callbackTotal, callbackMax, walTotal, walMax time.Duration
+			var walCalls int64
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				b.StopTimer()
+				stop := make(chan struct{})
+				done := make(chan writerResult, 1)
+				if c.writer {
+					ready := make(chan struct{})
+					go func() {
+						var result writerResult
+						defer func() { done <- result }()
+						for {
+							select {
+							case <-stop:
+								return
+							default:
+							}
+							start := time.Now()
+							result.err = wal.Log(writerRecord)
+							elapsed := time.Since(start)
+							result.total += elapsed
+							result.max = max(result.max, elapsed)
+							result.calls++
+							if result.calls == 1 {
+								// Signal startup; subsequent contention still depends on scheduling.
+								close(ready)
+							}
+							if result.err != nil {
+								return
+							}
+						}
+					}()
+					<-ready
+				}
+				inserted := false
+				log := func(encode func() []byte) error {
+					if c.late && !inserted {
+						for _, s := range f.recreated {
+							if _, created := index.setUnlessAlreadySet(s.lset.Hash(), s.lset, s); !created {
+								return fmt.Errorf("recreated series %d was not cleaned up", s.ref)
+							}
+						}
+						inserted = true
+					}
+					start := time.Now()
+					err := wal.LogWithCallback(func() []byte {
+						start := time.Now()
+						rec := encode()
+						elapsed := time.Since(start)
+						callbackTotal += elapsed
+						callbackMax = max(callbackMax, elapsed)
+						return rec
+					})
+					elapsed := time.Since(start)
+					walTotal += elapsed
+					walMax = max(walMax, elapsed)
+					walCalls++
+					return err
+				}
+				b.StartTimer()
+				appendErr := head.logSeriesTombstones(f.deletedLabels, log)
+				b.StopTimer()
+				if c.writer {
+					close(stop)
+					result := <-done
+					writerStats.calls += result.calls
+					writerStats.total += result.total
+					writerStats.max = max(writerStats.max, result.max)
+					require.NoError(b, result.err)
+				}
+				require.NoError(b, appendErr)
+				if c.late {
+					for _, s := range f.recreated {
+						index.unlinkHash(s.lset.Hash(), s.ref)
+						stripe := index.refStripe(s.ref)
+						index.locks[stripe].Lock()
+						delete(index.series[stripe], s.ref)
+						index.locks[stripe].Unlock()
+					}
+				}
+			}
+			b.ReportMetric(float64(callbackTotal)/float64(b.N), "callback-ns/op")
+			b.ReportMetric(float64(callbackMax), "callback-max-ns")
+			b.ReportMetric(float64(walTotal)/float64(b.N), "wal-call-ns/op")
+			b.ReportMetric(float64(walMax), "wal-call-max-ns")
+			b.ReportMetric(float64(walCalls)/float64(b.N), "wal-calls/op")
+			if c.writer {
+				b.ReportMetric(float64(writerStats.total)/float64(writerStats.calls), "writer-avg-ns")
+				b.ReportMetric(float64(writerStats.max), "writer-max-ns")
+				b.ReportMetric(float64(writerStats.calls)/float64(b.N), "writer-logs/op")
+			}
+		})
+	}
+}
+
+func evictionWALBenchmarkLabels(prefix string, i int) labels.Labels {
+	return labels.FromStrings(
+		"__name__", "http_requests_total",
+		"cluster", "production-eu-1",
+		"instance", "10.0.0."+strconv.Itoa(i%255)+":9090",
+		"job", "api",
+		"namespace", "observability",
+		"pod", "api-"+strconv.Itoa(i%10000),
+		"region", "eu-central-1",
+		"service", "frontend",
+		"tenant", "tenant-a",
+		"series", prefix+"-"+strconv.Itoa(i),
+	)
 }
