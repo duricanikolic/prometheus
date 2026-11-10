@@ -15,6 +15,7 @@ package tsdb
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -1583,30 +1584,44 @@ type deletedSeries struct {
 	hash uint64
 }
 
+// Bound the number of candidates checked during one WAL lock acquisition.
+const evictionTombstoneBatchSize = 4096
+
 // Log tombstones for deleted series, excluding labels that were recreated.
-// The log function must call encode synchronously under the WAL write lock and
-// must not retain the encoded record after returning. A nil result from encode
-// means that every tombstone was skipped, so no record must be written.
+// The log function must call encode synchronously under the WAL write lock.
+// It must copy any record it retains, since the encoding buffer is reused after
+// log returns. A nil result must skip writing a record.
 func (h *Head) logSeriesTombstones(deletedLabels map[chunks.HeadSeriesRef]deletedSeries, log func(encode func() []byte) error) error {
+	if len(deletedLabels) == 0 {
+		return nil
+	}
+	type candidate struct {
+		ref chunks.HeadSeriesRef
+		deletedSeries
+	}
+	batchSize := min(evictionTombstoneBatchSize, len(deletedLabels))
+	batch := make([]candidate, 0, batchSize)
 	// Allocate the full-range intervals before acquiring the WAL write lock.
-	stones := make([]tombstones.Stone, len(deletedLabels))
+	stones := make([]tombstones.Stone, batchSize)
 	for i := range stones {
 		stones[i].Intervals = tombstones.Intervals{{Mint: math.MinInt64, Maxt: math.MaxInt64}}
 	}
+	var enc record.Encoder
+	// Reserve the type byte, ref, and two varints per full-range tombstone.
+	buf := make([]byte, 0, 1+batchSize*(8+2*binary.MaxVarintLen64))
 	// Check for recreated labels under the WAL's write lock. A replacement
 	// created after its check can still be appended to, but its declaration
 	// cannot reach the WAL until after this tombstone.
-	return log(func() []byte {
+	encode := func() []byte {
 		n := 0
-		// Iterate the saved metadata directly to avoid another lookup by ref.
-		for ref, series := range deletedLabels {
+		for _, series := range batch {
 			// Replay aliases duplicate labels onto the old ref. Its tombstone
 			// would then delete the replacement's samples too. Skip the tombstone
 			// and let the old records expire through the normal WAL cutoff.
-			if live := h.series.getByHash(series.hash, series.lset); live != nil && live.ref != ref {
+			if live := h.series.getByHash(series.hash, series.lset); live != nil && live.ref != series.ref {
 				continue
 			}
-			stones[n].Ref = storage.SeriesRef(ref)
+			stones[n].Ref = storage.SeriesRef(series.ref)
 			n++
 		}
 		if h.testBeforeWALTombstonesLogged != nil {
@@ -1616,9 +1631,24 @@ func (h *Head) logSeriesTombstones(deletedLabels map[chunks.HeadSeriesRef]delete
 		if n == 0 {
 			return nil
 		}
-		var enc record.Encoder
-		return enc.Tombstones(stones[:n], nil)
-	})
+		buf = enc.Tombstones(stones[:n], buf[:0])
+		return buf
+	}
+	// Gather each batch outside the WAL lock. Bound candidates, rather than
+	// survivors, so even batches of recreated labels release the lock regularly.
+	for ref, series := range deletedLabels {
+		batch = append(batch, candidate{ref: ref, deletedSeries: series})
+		if len(batch) == batchSize {
+			if err := log(encode); err != nil {
+				return err
+			}
+			batch = batch[:0]
+		}
+	}
+	if len(batch) > 0 {
+		return log(encode)
+	}
+	return nil
 }
 
 // WaitForPendingReadersInTimeRange waits for queries overlapping with given range to finish querying.

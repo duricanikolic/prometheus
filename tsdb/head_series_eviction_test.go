@@ -15,6 +15,7 @@ package tsdb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"path/filepath"
@@ -779,6 +780,131 @@ func TestHead_logSeriesTombstones(t *testing.T) {
 	}
 }
 
+func TestSeriesEviction_TombstoneBatches(t *testing.T) {
+	const batchSize = 4096
+	for _, tc := range []struct {
+		name     string
+		series   int
+		recreate string
+		failAt   int
+		calls    int
+		records  int
+		stones   int
+	}{
+		{name: "empty"},
+		{name: "single", series: 1, calls: 1, records: 1, stones: 1},
+		{name: "full batch", series: batchSize, calls: 1, records: 1, stones: batchSize},
+		{name: "partial tail", series: batchSize + 1, calls: 2, records: 2, stones: batchSize + 1},
+		{name: "multiple batches", series: 2*batchSize + 1, calls: 3, records: 3, stones: 2*batchSize + 1},
+		{name: "fully filtered", series: 2 * batchSize, recreate: "before", calls: 2},
+		{name: "recreated between batches", series: 2*batchSize + 1, recreate: "between", calls: 3, records: 1, stones: batchSize},
+		{name: "write error stops batches", series: 2*batchSize + 1, failAt: 2, calls: 2, records: 1, stones: batchSize},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := newTestDB(t)
+			db.DisableCompactions()
+			app := db.Appender(t.Context())
+			refs := make([]storage.SeriesRef, 0, tc.series)
+			for i := range tc.series {
+				ref, err := app.Append(0, evictionTestLabels(i), 100, float64(i))
+				require.NoError(t, err)
+				refs = append(refs, ref)
+			}
+			require.NoError(t, app.Commit())
+			head := db.Head()
+			_, metadata := head.gcSeries(refs, 100, func(*memSeries) bool { return true })
+			require.Len(t, metadata, tc.series)
+
+			logged := make(map[storage.SeriesRef]bool)
+			expectedRecreated := make(map[string]int)
+			recreate := func() {
+				app := db.Appender(t.Context())
+				for ref, series := range metadata {
+					if logged[storage.SeriesRef(ref)] {
+						continue
+					}
+					newRef, err := app.Append(0, series.lset, 200, 42)
+					require.NoError(t, err)
+					require.NotEqual(t, storage.SeriesRef(ref), newRef)
+					expectedRecreated[series.lset.String()] = 1
+				}
+				require.NoError(t, app.Commit())
+			}
+			if tc.recreate == "before" {
+				recreate()
+			}
+			calls, records := 0, 0
+			writeErr := errors.New("tombstone write failed")
+			var dec record.Decoder
+			err := head.logSeriesTombstones(metadata, func(encode func() []byte) error {
+				calls++
+				if calls == tc.failAt {
+					return writeErr
+				}
+				if err := head.wal.LogWithCallback(func() []byte {
+					rec := encode()
+					if rec == nil {
+						return nil
+					}
+					stones, err := dec.Tombstones(rec, nil)
+					require.NoError(t, err)
+					require.NotEmpty(t, stones)
+					require.LessOrEqual(t, len(stones), batchSize)
+					for _, stone := range stones {
+						require.False(t, logged[stone.Ref], "a ref must be tombstoned only once")
+						logged[stone.Ref] = true
+					}
+					records++
+					return rec
+				}); err != nil {
+					return err
+				}
+				if tc.recreate == "between" && calls == 1 {
+					// Commit declarations after batch one releases the WAL lock.
+					// Every remaining candidate must be checked again in its own batch.
+					recreate()
+				}
+				return nil
+			})
+			if tc.failAt > 0 {
+				require.ErrorIs(t, err, writeErr)
+			} else {
+				require.NoError(t, err)
+			}
+			require.Equal(t, tc.calls, calls)
+			require.Equal(t, tc.records, records)
+			require.Len(t, logged, tc.stones)
+
+			walRecords := 0
+			walRefs := make(map[storage.SeriesRef]bool)
+			for _, entry := range readTestWAL(t, filepath.Join(db.Dir(), "wal")) {
+				if stones, ok := entry.([]tombstones.Stone); ok {
+					walRecords++
+					require.NotEmpty(t, stones, "fully filtered batches must not write a record")
+					for _, stone := range stones {
+						require.Equal(t, tombstones.Intervals{{Mint: math.MinInt64, Maxt: math.MaxInt64}}, stone.Intervals)
+						require.False(t, walRefs[stone.Ref])
+						walRefs[stone.Ref] = true
+					}
+				}
+			}
+			require.Equal(t, records, walRecords)
+			require.Equal(t, logged, walRefs, "buffer reuse must preserve all previously logged records")
+			if tc.recreate != "" {
+				require.Len(t, expectedRecreated, tc.series-tc.stones)
+				require.NoError(t, db.Close())
+				reopened, err := Open(db.Dir(), nil, nil, db.opts, nil)
+				require.NoError(t, err)
+				reopened.DisableCompactions()
+				t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+				reading := openSampleQuerier(t, reopened, 200, 200)
+				require.Equal(t, expectedRecreated, reading.mustRead(t))
+				require.NoError(t, reading.close())
+			}
+		})
+	}
+}
+
 func TestEvictedSeries_Contains(t *testing.T) {
 	refs := []storage.SeriesRef{3, 5, 6, 100, 1 << 40}
 
@@ -977,6 +1103,8 @@ func TestSeriesEviction_QueryStartingAtLastTimestampIsWaitedForByNextEviction(t 
 // ten labels per candidate and 100,000 unrelated live series. Compaction, GC and
 // fixture construction are excluded. The late cases recreate 10% of the labels
 // immediately before entering the WAL, with insertion included in ns/op.
+// Cases at 4096/4097 candidates cover the batch boundary. The late=100 case
+// checks batches that validate candidates but write no tombstone records.
 //
 // Callback time is spent under the WAL write lock, excluding the record write.
 // WAL-call time includes lock acquisition, the callback and the write; it is not
@@ -989,7 +1117,7 @@ func BenchmarkEvictionWALBlocking(b *testing.B) {
 	type fixture struct {
 		deleted       map[storage.SeriesRef]struct{}
 		deletedLabels map[chunks.HeadSeriesRef]deletedSeries
-		recreated     []*memSeries
+		recreated     map[int][]*memSeries
 	}
 	// Reuse expensive fixtures across calibration runs and compression/load cases,
 	// without retaining them in package globals after the benchmark finishes.
@@ -999,7 +1127,7 @@ func BenchmarkEvictionWALBlocking(b *testing.B) {
 		series   int
 		compress compression.Type
 		writer   bool
-		late     bool
+		late     int
 	}
 	var cases []benchmarkCase
 	for _, n := range []int{1000, 10000, 100000, 1000000} {
@@ -1009,18 +1137,19 @@ func BenchmarkEvictionWALBlocking(b *testing.B) {
 			}
 		}
 	}
-	for _, n := range []int{100000, 1000000} {
-		cases = append(cases, benchmarkCase{series: n, compress: compression.Snappy, writer: true, late: true})
+	for _, n := range []int{4096, 4097} {
+		cases = append(cases, benchmarkCase{series: n, compress: compression.Snappy, writer: true})
 	}
+	for _, n := range []int{100000, 1000000} {
+		cases = append(cases, benchmarkCase{series: n, compress: compression.Snappy, writer: true, late: 10})
+	}
+	cases = append(cases, benchmarkCase{series: 8192, compress: compression.Snappy, writer: true, late: 100})
 	for _, c := range cases {
-		load, latePercent := "idle", 0
+		load := "idle"
 		if c.writer {
 			load = "writer"
 		}
-		if c.late {
-			latePercent = 10
-		}
-		b.Run(fmt.Sprintf("series=%d/compress=%s/load=%s/late=%d", c.series, c.compress, load, latePercent), func(b *testing.B) {
+		b.Run(fmt.Sprintf("series=%d/compress=%s/load=%s/late=%d", c.series, c.compress, load, c.late), func(b *testing.B) {
 			if index == nil {
 				index = newStripeSeries(DefaultStripeSize, noopSeriesLifecycleCallback{})
 				for i := range 100000 {
@@ -1034,6 +1163,7 @@ func BenchmarkEvictionWALBlocking(b *testing.B) {
 				f = &fixture{
 					deleted:       make(map[storage.SeriesRef]struct{}, c.series),
 					deletedLabels: make(map[chunks.HeadSeriesRef]deletedSeries, c.series),
+					recreated:     make(map[int][]*memSeries),
 				}
 				for i := range c.series {
 					ref := storage.SeriesRef(i + 1)
@@ -1044,12 +1174,14 @@ func BenchmarkEvictionWALBlocking(b *testing.B) {
 				}
 				fixtures[c.series] = f
 			}
-			if c.late && f.recreated == nil {
-				for i := 0; i < c.series; i += 10 {
+			recreated := f.recreated[c.late]
+			if c.late > 0 && recreated == nil {
+				for i := 0; i < c.series; i += 100 / c.late {
 					// Fresh label storage also exercises equality checks for recreated labels.
 					lset := evictionWALBenchmarkLabels("deleted", i)
-					f.recreated = append(f.recreated, newMemSeries(lset, chunks.HeadSeriesRef(20000000+i), 0, false, false))
+					recreated = append(recreated, newMemSeries(lset, chunks.HeadSeriesRef(20000000+i), 0, false, false))
 				}
+				f.recreated[c.late] = recreated
 			}
 			wal, err := wlog.New(nil, nil, b.TempDir(), c.compress)
 			require.NoError(b, err)
@@ -1072,7 +1204,7 @@ func BenchmarkEvictionWALBlocking(b *testing.B) {
 			}
 			var writerStats writerResult
 			var callbackTotal, callbackMax, walTotal, walMax time.Duration
-			var walCalls int64
+			var walCalls, walRecords int64
 			b.ReportAllocs()
 			b.ResetTimer()
 			for range b.N {
@@ -1109,8 +1241,8 @@ func BenchmarkEvictionWALBlocking(b *testing.B) {
 				}
 				inserted := false
 				log := func(encode func() []byte) error {
-					if c.late && !inserted {
-						for _, s := range f.recreated {
+					if c.late > 0 && !inserted {
+						for _, s := range recreated {
 							if _, created := index.setUnlessAlreadySet(s.lset.Hash(), s.lset, s); !created {
 								return fmt.Errorf("recreated series %d was not cleaned up", s.ref)
 							}
@@ -1121,6 +1253,9 @@ func BenchmarkEvictionWALBlocking(b *testing.B) {
 					err := wal.LogWithCallback(func() []byte {
 						start := time.Now()
 						rec := encode()
+						if rec != nil {
+							walRecords++
+						}
 						elapsed := time.Since(start)
 						callbackTotal += elapsed
 						callbackMax = max(callbackMax, elapsed)
@@ -1144,8 +1279,8 @@ func BenchmarkEvictionWALBlocking(b *testing.B) {
 					require.NoError(b, result.err)
 				}
 				require.NoError(b, appendErr)
-				if c.late {
-					for _, s := range f.recreated {
+				if c.late > 0 {
+					for _, s := range recreated {
 						index.unlinkHash(s.lset.Hash(), s.ref)
 						stripe := index.refStripe(s.ref)
 						index.locks[stripe].Lock()
@@ -1159,6 +1294,7 @@ func BenchmarkEvictionWALBlocking(b *testing.B) {
 			b.ReportMetric(float64(walTotal)/float64(b.N), "wal-call-ns/op")
 			b.ReportMetric(float64(walMax), "wal-call-max-ns")
 			b.ReportMetric(float64(walCalls)/float64(b.N), "wal-calls/op")
+			b.ReportMetric(float64(walRecords)/float64(b.N), "wal-records/op")
 			if c.writer {
 				b.ReportMetric(float64(writerStats.total)/float64(writerStats.calls), "writer-avg-ns")
 				b.ReportMetric(float64(writerStats.max), "writer-max-ns")
