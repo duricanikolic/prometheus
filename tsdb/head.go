@@ -1601,10 +1601,12 @@ func (h *Head) logSeriesTombstones(deletedLabels map[chunks.HeadSeriesRef]delete
 	}
 	batchSize := min(evictionTombstoneBatchSize, len(deletedLabels))
 	batch := make([]candidate, 0, batchSize)
-	// Allocate the full-range intervals before acquiring the WAL write lock.
+	// Prepare full-range tombstones before acquiring the WAL write lock.
+	// The encoder only reads the interval, so it can be shared across the batch.
 	stones := make([]tombstones.Stone, batchSize)
+	intervals := tombstones.Intervals{{Mint: math.MinInt64, Maxt: math.MaxInt64}}
 	for i := range stones {
-		stones[i].Intervals = tombstones.Intervals{{Mint: math.MinInt64, Maxt: math.MaxInt64}}
+		stones[i].Intervals = intervals
 	}
 	var enc record.Encoder
 	// Reserve the type byte, ref, and two varints per full-range tombstone.
