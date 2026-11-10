@@ -176,7 +176,8 @@ type Head struct {
 	// the open readers, and before it removes the series. Tests use it to open a reader at the point
 	// where a reader would otherwise not be waited for.
 	testAfterWaitingForReadersToEvictSeries func()
-	// Tests use testBeforeWALTombstonesLogged to recreate a series after selecting
+	// TODO: find a better solution than this test hook in production code.
+	// testBeforeWALTombstonesLogged is used in tests to recreate a series after selecting
 	// the eviction tombstones, while series declarations are excluded from the WAL.
 	// Series creation itself must remain possible after the collision check.
 	testBeforeWALTombstonesLogged func()
@@ -1578,7 +1579,7 @@ func (h *Head) truncateSeries(seriesRefs []storage.SeriesRef, maxt int64, should
 	return len(deleted), nil
 }
 
-// A deletedSeries retains the labels and existing index hash of a removed series.
+// deletedSeries retains the labels and existing index hash of a removed series.
 type deletedSeries struct {
 	lset labels.Labels
 	hash uint64
@@ -1587,7 +1588,7 @@ type deletedSeries struct {
 // Bound the number of candidates checked during one WAL lock acquisition.
 const evictionTombstoneBatchSize = 4096
 
-// Log tombstones for deleted series, excluding labels that were recreated.
+// logSeriesTombstones logs tombstones for deleted series, excluding labels that were recreated.
 // The log function must call encode synchronously under the WAL write lock.
 // It must copy any record it retains, since the encoding buffer is reused after
 // log returns. A nil result must skip writing a record.
